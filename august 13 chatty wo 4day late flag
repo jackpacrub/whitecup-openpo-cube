@@ -1,0 +1,262 @@
+WITH cte_item AS (
+  SELECT item.company_it
+       , item.item
+       , item.product_line
+       , item.vendor
+       , item.qty_um
+       , item.um_qty
+       , item.um
+       , item.keep_inventory
+       , item.stat
+       , CAST(SPLIT_PART(item.um_qty, ';', 1) AS INTEGER) AS "um_qty_1"
+       , CAST(SPLIT_PART(item.um_qty, ';', 2) AS INTEGER) AS "um_qty_2"
+       , CAST(SPLIT_PART(item.um_qty, ';', 3) AS INTEGER) AS "um_qty_3"
+       , CAST(SPLIT_PART(item.um_qty, ';', 4) AS INTEGER) AS "um_qty_4"
+       , SPLIT_PART(item.um, ';', 1) AS "um_1"
+       , SPLIT_PART(item.um, ';', 2) AS "um_2"
+       , SPLIT_PART(item.um, ';', 3) AS "um_3"
+       , SPLIT_PART(item.um, ';', 4) AS "um_4"
+       , SPLIT_PART(item.um, ';', 5) AS "um_5"
+    FROM ${connection.table_prefix}item AS item
+   WHERE item.item IN (SELECT po_line.item FROM ${connection.table_prefix}po_line AS po_line)
+),
+/* Aggregate Received-To-Date across receipts per PO line */
+cte_rtd AS (
+  SELECT pl.company_it
+       , pl.po
+       , pl.rec_type
+       , pl.line_add
+       , SUM(pl.q_rcv) AS qty_rtd_total
+  FROM ${connection.table_prefix}po_line pl
+  WHERE pl.rec_type = 'R'
+  GROUP BY 1,2,3,4
+),
+cte_po_line AS (
+  SELECT po_line.*
+       , CASE WHEN item.item IS NULL
+                OR LENGTH(RTRIM(po_line.um_o)) = 0
+                OR (STRPOS(RTRIM(UPPER(item.um)), RTRIM(UPPER(po_line.um_o)))) = 0
+                OR (STRPOS(RTRIM(UPPER(item.um)), RTRIM(UPPER(po_line.um_o)))) = 1
+              THEN 1
+              WHEN item.um_qty_1 = 0 AND item.um_qty_2 = 0 AND item.um_qty_3 = 0 AND item.um_qty_4 = 0
+              THEN 1
+              WHEN po_line.um_o = item.um_2 THEN COALESCE(NULLIF(item.um_qty_1, 0), 1)
+              WHEN po_line.um_o = item.um_3 THEN COALESCE(NULLIF(item.um_qty_2, 0), 1)
+              WHEN po_line.um_o = item.um_4 THEN COALESCE(NULLIF(item.um_qty_3, 0), 1)
+              WHEN po_line.um_o = item.um_5 THEN COALESCE(NULLIF(item.um_qty_4, 0), 1)
+              ELSE 1
+          END AS used_UM_conversion_factor
+       , rtd.qty_rtd_total
+    FROM ${connection.table_prefix}po_line AS po_line
+    LEFT JOIN cte_item AS item
+      ON item.company_it = po_line.company_it
+     AND item.item       = po_line.item
+    LEFT JOIN cte_rtd AS rtd
+      ON rtd.company_it = po_line.company_it
+     AND rtd.po         = po_line.po
+     AND rtd.rec_type   = po_line.rec_type
+     AND rtd.line_add   = po_line.line_add
+)
+SELECT CONCAT(    '${connection.connection_prefix}',
+         COALESCE(CAST(po_line.po AS VARCHAR(25)), 'noPO'), '!',
+         COALESCE(CAST(po_line.rec_seq AS VARCHAR(25)), 'noRecSeq'), '!',
+         COALESCE(CAST(po_line.rec_type AS VARCHAR(25)), 'noRecType'), '!',
+         RTRIM(UPPER(po_line.company_ve)), '!',
+         COALESCE(CAST(po_line.line_add AS VARCHAR(25)), 'noLineAdd'), '!',
+         COALESCE(CAST(po_line.rec_seq_recv AS VARCHAR(25)), 'noRecSeqRecv'))
+                                                           AS "id"      -- unique record key
+  -- Dates
+     , CAST('${connection.get_date}' AS DATE)              AS "open_dt"        -- cube date
+     , CASE WHEN po_head.ord_date < CAST('1753-01-01' AS DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(po_head.ord_date AS DATE)
+        END                                                AS "order_dt"
+  -- other
+     , CONCAT('${connection.connection_prefix}' ,
+         CAST(po_line.po AS VARCHAR(25)))                  AS "header_id"
+
+  ------------- Identifiers -------------------------------------------------
+     , CONCAT('${connection.connection_prefix}', RTRIM(UPPER(warehouse.buyer_code)))      AS "buyer_location"
+     , CONCAT('${connection.connection_prefix}', RTRIM(UPPER(vendor.buyer_code)))         AS "buyer_vendor_bill_from"
+     , CONCAT('${connection.connection_prefix}', RTRIM(UPPER(po_line.company_it)))        AS "company"
+     , CONCAT('${connection.connection_prefix}', RTRIM(UPPER(po_head.vendor)))            AS "vendor_bill_from"
+     , CONCAT('${connection.connection_prefix}', RTRIM(UPPER(item.vendor)))               AS "vendor_product"
+     , CONCAT('${connection.connection_prefix}', RTRIM(UPPER(po_line.item)))              AS "product"
+     , CONCAT('${connection.connection_prefix}', RTRIM(UPPER(item.product_line)))         AS "product_type"
+     , LPAD(CAST(wa_item.classification AS VARCHAR(2)), 2, '0')                           AS "product_type2"
+     , CASE WHEN item.keep_inventory = true THEN 'stockable' ELSE 'non-stockable' END     AS "product_type3"
+     , CONCAT('${connection.connection_prefix}', RTRIM(UPPER(COALESCE(item.stat,''))))    AS "product_type5"
+     , RTRIM(UPPER(po_head.enter_by))                                                     AS "user_po_writer"
+     , CONCAT('${connection.connection_prefix}', RTRIM(UPPER(po_line.warehouse)))         AS "location"
+     , CONCAT('${connection.connection_prefix}', RTRIM(UPPER(po_line.ord_class)))         AS "transaction_type2"
+     , RTRIM(UPPER(po_head.rec_type))                                                     AS "transaction_type8"
+     , CAST('' AS VARCHAR(1))                                                             AS "vendor_ship_from"
+
+  ------------- Accumulators ------------------------------------------------
+     -- amounts
+     , CASE WHEN RTRIM(UPPER(po_head.rec_type)) = 'R'
+            THEN (po_line.o_ext * -1)
+            ELSE po_line.o_ext
+        END                                                AS "open_amt"
+     , po_line.o_ext                                       AS "ordered_amt"
+     , po_line.bo_ext                                      AS "backordered_amt"
+     , po_line.r_ext                                       AS "received_amt"
+     , po_line.rtd_ext                                     AS "returned_amt"
+     , po_line.i_ext                                       AS "invoiced_amt"
+     , CASE WHEN po_class.hit_inventory = FALSE THEN po_line.o_ext ELSE 0 END  AS "ordered_direct_amt"
+     , CASE WHEN po_class.hit_inventory = TRUE  THEN po_line.o_ext ELSE 0 END  AS "ordered_stock_amt"
+
+     -- quantities (normalized)
+     , GREATEST(
+         ROUND(po_line.q_ord / po_line.used_UM_conversion_factor, 0) -
+         ROUND(COALESCE(po_line.qty_rtd_total, 0) / po_line.used_UM_conversion_factor, 0)
+       , 0)                                                AS "open_qty"
+
+     , ROUND(po_line.q_ord / po_line.used_UM_conversion_factor, 0)              AS "ordered_qty"
+     , ROUND(po_line.q_bo  / po_line.used_UM_conversion_factor, 0)              AS "backordered_qty"
+     , ROUND(po_line.q_rcv / po_line.used_UM_conversion_factor, 0)              AS "received_qty"
+     , ROUND(po_line.q_rtd / po_line.used_UM_conversion_factor, 0)              AS "returned_qty"
+     , ROUND(po_line.q_inv / po_line.used_UM_conversion_factor, 0)              AS "invoiced_qty"
+
+     , CASE WHEN po_class.hit_inventory = false
+            THEN ROUND(po_line.q_ord / po_line.used_UM_conversion_factor, 0)
+            ELSE 0
+        END                                                AS "ordered_direct_qty"
+
+     , CASE WHEN po_class.hit_inventory = true
+            THEN ROUND(po_line.q_rcv / po_line.used_UM_conversion_factor, 0)
+            ELSE 0
+        END                                                AS "ordered_stock_qty"
+
+     /* Qty Ordered vs Qty RTD (normalized) for transparency */
+     , ROUND(po_line.q_ord / po_line.used_UM_conversion_factor, 0)                      AS "qty_ordered_conv"
+     , ROUND(COALESCE(po_line.qty_rtd_total, 0) / po_line.used_UM_conversion_factor, 0) AS "qty_rtd_conv"
+     , GREATEST(
+         ROUND(po_line.q_ord / po_line.used_UM_conversion_factor, 0) -
+         ROUND(COALESCE(po_line.qty_rtd_total, 0) / po_line.used_UM_conversion_factor, 0)
+       , 0)                                                                             AS "qty_open_rtd"
+
+     -- day counts
+     , DATE_DIFF('day', po_head.ord_date, CAST('${connection.get_date}' AS DATE))       AS "open_day_cnt"
+
+     -- line counts
+     , 1                                                                                AS "open_line_cnt"
+
+     , CASE WHEN COALESCE(po_line.wanted_date, po_head.exp_date,  po_line.req_date, po_head.wanted_date, po_head.ord_date) < CAST('1753-01-01' as DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(COALESCE(po_line.wanted_date, po_head.exp_date, po_head.wanted_date, po_line.req_date,  po_head.ord_date) AS DATE)
+        END                                                AS "due_dt"
+
+     /* Reverted: late if current date > due date (no grace) */
+     , CASE WHEN CAST('${connection.get_date}' AS DATE) >
+                    COALESCE(po_line.wanted_date, po_head.exp_date, po_line.req_date, po_head.wanted_date, po_head.ord_date)
+            THEN 'Y'
+            ELSE 'N'
+        END                                                AS "due_late_flg"
+
+------------- Details -----------------------------------------------------
+     , CASE WHEN po_head.ord_date < CAST('1753-01-01' AS DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(po_head.ord_date AS DATE)
+        END                                                AS "ordered_dt"
+     , CASE WHEN po_head.post_date < CAST('1753-01-01' AS DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(po_head.post_date AS DATE)
+        END                                                AS "posted_dt"
+     , CASE WHEN po_head.wanted_date < CAST('1753-01-01' AS DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(po_head.wanted_date AS DATE)
+        END                                                AS  "wanted_dt"
+     , po_line.po                                          AS "po_id"
+     , po_line.rec_type                                    AS "po_record_type_cd"
+     , po_line.rec_seq                                     AS "po_record_seq_num"
+     , po_line.line                                        AS "po_line_id"
+     , po_line.line_add                                    AS "line_added_seq_num"
+     , po_head.po_ext                                      AS "external_po_id"
+     , po_head.ship_id                                     AS "ship_to_id"
+     , po_line.price                                       AS "unit_price"
+
+  ------------- Audit Columns -----------------------------------------------
+     , CASE WHEN po_head.exp_date< CAST('1753-01-01' AS DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(po_head.exp_date AS DATE)
+        END                                                AS "exp_date"
+     , po_head.last_line                                   AS "last_line"
+     , CASE WHEN po_head.ord_date < CAST('1753-01-01' AS DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(po_head.ord_date AS DATE)
+        END                                                AS "ord_date"
+     , po_head.pieces                                      AS "pieces"
+     , CASE WHEN po_head.rcv_date < CAST('1753-01-01' AS DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(po_head.rcv_date AS DATE)
+        END                                                AS "rcv_date"
+     , CASE WHEN po_head.wanted_date < CAST('1753-01-01' AS DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(po_head.wanted_date AS DATE)
+        END                                                AS "wanted_date"
+     , po_line.ovrd_lead_time                              AS "ovrd_lead_time"
+     , CASE WHEN po_line.req_date < CAST('1753-01-01' AS DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(po_line.req_date AS DATE)
+        END                                                AS req_date
+
+     , CASE WHEN po_line.wanted_date < CAST('1753-01-01' AS DATE)
+            THEN CAST('1753-01-01' AS DATE)
+            ELSE CAST(po_line.wanted_date AS DATE)
+        END                                                AS "line_wanted_date"
+
+     , po_line.q_ord                                       AS "q_ord"
+     , po_line.q_rcv                                       AS "q_rcv"
+     , po_head.opn                                         AS "opn"
+     , RTRIM(UPPER(po_line.company_it))                    AS "po_line_company"
+     , CAST(po_line.rec_type AS VARCHAR(25))               AS "po_line_rec_typ"
+     , CAST(po_line.po       AS VARCHAR(25))               AS "po_line_po"
+     , CAST(po_line.line_add AS VARCHAR(25))               AS "po_line_line_add"
+     , CAST(po_line.rec_seq  AS VARCHAR(25))               AS "po_line_rec_seq"
+     , CAST(po_line.line     AS VARCHAR(25))               AS "po_line_line"
+     , po_class.hit_inventory                              AS "po_class_hit_inventory"
+
+     , wa_item.company_it                                  AS "wa_item_company_it"
+     , wa_item.item                                        AS "wa_item_item"
+     , wa_item.warehouse                                   AS "wa_item_warehouse"
+     , wa_item.classification                              AS "wa_item_classification"
+
+  FROM ${connection.table_prefix}po_head AS po_head
+
+  LEFT JOIN cte_po_line AS po_line
+    ON po_line.po         = po_head.po
+   AND po_line.rec_seq    = po_head.rec_seq
+   AND po_line.rec_type   = po_head.rec_type
+   AND po_line.company_it = po_head.company_it
+
+  LEFT JOIN cte_item AS item
+    ON item.company_it = po_line.company_it
+   AND item.item       = po_line.item
+
+  LEFT JOIN ${connection.table_prefix}wa_item AS wa_item
+    ON wa_item.company_it = po_line.company_it
+   AND wa_item.item       = po_line.item
+   AND wa_item.warehouse  = po_line.warehouse
+
+  LEFT JOIN ${connection.table_prefix}po_class AS po_class
+   ON po_class.company_it = po_line.company_it
+  AND po_class.ord_class  = po_line.ord_class
+
+  LEFT JOIN ${connection.table_prefix}warehouse AS warehouse
+    ON po_line.company_it = warehouse.company_it
+   AND po_line.warehouse = warehouse.warehouse
+
+  LEFT JOIN ${connection.table_prefix}vendor AS vendor
+    ON po_head.company_ve = vendor.company_ve
+   AND po_head.vendor = vendor.vendor
+
+ WHERE po_line.company_it IN (${connection.company_list})
+   /* Replace flag with quantity logic: open if QtyOrdered - QtyRTD > 0 */
+   AND (
+         ROUND(po_line.q_ord / po_line.used_UM_conversion_factor, 0) -
+         ROUND(COALESCE(po_line.qty_rtd_total, 0) / po_line.used_UM_conversion_factor, 0)
+       ) > 0
+   AND RTRIM(UPPER(po_head.rec_type)) <> 'Q'
+   AND RTRIM(UPPER(po_head.rec_type)) <> 'I'
+;
